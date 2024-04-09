@@ -10,6 +10,7 @@ import (
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -86,6 +87,9 @@ func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr,
 		}
 	} else if authResponse.Method != socks5.AuthTypeNotRequired {
 		return socks5.Response{}, E.New("socks5: unsupported auth method: ", authResponse.Method)
+	}
+	if command == socks5.CommandUDPAssociate {
+		destination = M.SocksaddrFrom(netip.IPv4Unspecified(), 0)
 	}
 	err = socks5.WriteRequest(conn, socks5.Request{
 		Command:     command,
@@ -244,6 +248,7 @@ func HandleConnectionEx(
 			if err != nil {
 				return err
 			}
+			var associatePacketConn N.PacketConn
 			if handlerEx == nil {
 				defer udpConn.Close()
 				err = socks5.WriteResponse(conn, socks5.Response{
@@ -253,13 +258,41 @@ func HandleConnectionEx(
 				if err != nil {
 					return err
 				}
-				destination = request.Destination
-				associatePacketConn := NewAssociatePacketConn(bufio.NewServerPacketConn(udpConn), destination, conn)
+				associatePacketConn = NewAssociatePacketConn(bufio.NewServerPacketConn(udpConn), request.Destination, conn)
+			} else {
+				associatePacketConn = NewLazyAssociatePacketConn(bufio.NewServerPacketConn(udpConn), request.Destination, conn)
+			}
+			done := make(chan struct{})
+			buffer := buf.NewPacket()
+			defer buffer.Release()
+			var (
+				destination M.Socksaddr
+				err         error
+			)
+			go func() {
+				destination, err = associatePacketConn.ReadPacket(buffer)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				associatePacketConn.Close()
+				return ctx.Err()
+			}
+			var cachedConn N.PacketConn
+			if !buffer.IsEmpty() {
+				cachedConn = bufio.NewCachedPacketConn(associatePacketConn, buffer, destination)
+			} else {
+				associatePacketConn.Close()
+				return err
+			}
+
+			if handlerEx == nil {
 				var innerError error
 				done := make(chan struct{})
 				go func() {
 					//nolint:staticcheck
-					innerError = handler.NewPacketConnection(ctx, associatePacketConn, M.Metadata{Protocol: "socks5", Source: source, Destination: destination})
+					innerError = handler.NewPacketConnection(ctx, cachedConn, M.Metadata{Protocol: "socks5", Source: source, Destination: destination})
 					close(done)
 				}()
 				err = common.Error(io.Copy(io.Discard, conn))
@@ -267,7 +300,7 @@ func HandleConnectionEx(
 				<-done
 				return E.Errors(innerError, err)
 			} else {
-				handlerEx.NewPacketConnectionEx(ctx, NewLazyAssociatePacketConn(bufio.NewServerPacketConn(udpConn), destination, conn), source, destination, onClose)
+				handlerEx.NewPacketConnectionEx(ctx, cachedConn, source, destination, onClose)
 				return nil
 			}
 		default:
